@@ -1,0 +1,18 @@
+model:
+  name: "microsoft/phi-2"
+  device: "auto"
+
+memory:
+  dim: 512
+  updater: "ema"
+  ema_alpha: 0.1
+  save_path: "data/memory_states/"
+
+injection:
+  method: "activation"
+  target_layer: 16
+  scale: 0.1
+
+baseline:
+  ollama_url: "http://localhost:11434"
+  ollama_model: "phi"
