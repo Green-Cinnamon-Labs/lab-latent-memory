@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "lab-latent-memory"
+version = "0.1.0"
+description = "Experimental lab for latent memory compression in LLMs"
+authors = ["matheuscorteletti-wmtrading"]
+packages = [{ include = "src" }, { include = "experiments" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+torch = ">=2.0"
+transformers = ">=4.40"
+accelerate = "*"
+numpy = "*"
+pyyaml = "*"
+requests = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
