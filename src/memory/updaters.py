@@ -79,6 +79,51 @@ class GRUUpdater(Updater):
         self.gru.load_state_dict(d)
 
 
+class VectorFieldUpdater(Updater):
+    """
+    Campo vetorial como operador de atualização (pivot vector-field memory).
+
+    mₜ₊₁ = mₜ + Δt · F(mₜ, eₜ; θ)
+
+    F é uma pequena rede que define um campo vetorial sobre o espaço de memória.
+    A memória não "armazena" experiências — o campo F é deformado por elas,
+    criando drains/sources/rotações no espaço que enviesam trajetórias futuras.
+
+    Δt controla o tamanho do passo de integração (estabilidade vs velocidade).
+    norm_clip previne divergência do vetor de memória.
+
+    Hipótese central a testar:
+      Queries similares submetidas ao mesmo campo F devem convergir para
+      regiões similares do espaço (trajectory consistency).
+    """
+
+    def __init__(self, memory_dim: int, input_dim: int, dt: float = 0.1, norm_clip: float = 10.0):
+        self.dt = dt
+        self.norm_clip = norm_clip
+        # F: campo vetorial parametrizado — recebe estado atual + entrada, retorna direção
+        self.field = nn.Sequential(
+            nn.Linear(memory_dim + input_dim, memory_dim),
+            nn.Tanh(),
+            nn.Linear(memory_dim, memory_dim),
+        )
+
+    def __call__(self, m_t: torch.Tensor, e_t: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([m_t, e_t], dim=-1)
+        direction = self.field(combined)           # F(mₜ, eₜ; θ)
+        m_next = m_t + self.dt * direction         # passo de integração Euler
+        # previne drift: se a norma explodir, reescala
+        norm = m_next.norm()
+        if norm > self.norm_clip:
+            m_next = m_next * (self.norm_clip / norm)
+        return m_next
+
+    def state_dict(self):
+        return self.field.state_dict()
+
+    def load_state_dict(self, d):
+        self.field.load_state_dict(d)
+
+
 class MLPUpdater(Updater):
     """
     MLP residual como operador.

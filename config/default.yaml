@@ -1,5 +1,5 @@
 model:
-  name: "microsoft/phi-2"
+  name: "HuggingFaceTB/SmolLM2-1.7B"
   device: "auto"
 
 memory:
@@ -10,9 +10,9 @@ memory:
 
 injection:
   method: "activation"
-  target_layer: 16
+  target_layer: 12
   scale: 0.1
 
 baseline:
   ollama_url: "http://localhost:11434"
-  ollama_model: "phi"
+  ollama_model: "smollm2:1.7b"

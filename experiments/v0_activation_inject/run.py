@@ -29,9 +29,9 @@ from src.injection.injector import ActivationInjector
 
 def main():
     # --- Configuração ---
-    MODEL_NAME = "microsoft/phi-2"  # ~2.7B params, roda em GPU com 8GB
+    MODEL_NAME = "HuggingFaceTB/SmolLM2-1.7B"  # MHA real, HF+Ollama oficial, ~9.2GB FP32
     MEMORY_DIM = 512
-    TARGET_LAYER = 16  # camada do meio (phi-2 tem 32 camadas)
+    TARGET_LAYER = 12  # camada do meio (SmolLM2-1.7B tem 24 camadas)
 
     print("=" * 60)
     print("EXPERIMENTO v0: Injeção de memória em ativações")
