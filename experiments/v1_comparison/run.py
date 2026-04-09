@@ -1,20 +1,25 @@
 """
-Experimento v1: benchmark comparativo de memória.
+Experimento v1: benchmark comparativo de memória com scale sweep.
 
-Três condições para cada caso de teste:
-  sem_memoria  — query enviada ao modelo sem histórico e sem injeção
-  ema_memoria  — mₜ acumulado via EMA + injeção em ativações (camada TARGET_LAYER)
-  full_context — histórico completo reinjetado via Ollama
+Três condições:
+  sem_memoria  — query sem histórico e sem injeção (scale=0)
+  ema_memoria  — mₜ acumulado via EMA + injeção direta (identidade, sem projeção)
+                 rodado para cada scale em SCALES
+  full_context — histórico completo via Ollama
 
-Métricas:
-  score       — fração de expected_elements encontrados na resposta (busca textual)
-  traj_norms  — norma de mₜ ao longo da conversa de seeding
-  traj_cos    — similaridade cosseno entre mₜ sucessivos (estabilidade de trajetória)
+Métricas de score:
+  score  — fração de expected_elements encontrados na resposta (busca textual)
+
+Métricas de trajetória de mₜ (por turno de seeding):
+  norm         — |mₜ|₂ : energia acumulada
+  cos_prev     — cos(mₜ, mₜ₋₁) : estabilidade direcional
+  step_size    — |mₜ - mₜ₋₁|₂ : quanto mudou no passo
+  component_std — std dos componentes : quão distribuída está a informação
 
 Para rodar:
-  1. Certifique-se de que o Ollama está rodando: ollama serve
-  2. Baixe o modelo baseline: ollama pull smollm2:1.7b
-  3. poetry run python -m experiments.v1_comparison.run
+  ollama serve                          (em terminal separado)
+  ollama pull smollm2:1.7b
+  poetry run python -m experiments.v1_comparison.run
 """
 
 import sys
@@ -23,7 +28,7 @@ sys.path.insert(0, ".")
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from src.model.loader import InstrumentedModel
 from src.memory.base import MemoryState
@@ -33,34 +38,49 @@ from src.baseline.full_context import FullContextBaseline
 from src.eval.metrics import SAMPLE_BENCHMARK, score_fact_retention, EvalCase
 
 
-MODEL_NAME = "HuggingFaceTB/SmolLM2-1.7B"
-TARGET_LAYER = 12    # camada do meio (SmolLM2-1.7B tem 24 camadas)
-EMA_ALPHA = 0.1
-INJECT_SCALE = 0.1
+MODEL_NAME   = "HuggingFaceTB/SmolLM2-1.7B"
+TARGET_LAYER = 12
+EMA_ALPHA    = 0.1
+SCALES       = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0]
 MAX_NEW_TOKENS = 100
 OLLAMA_MODEL = "smollm2:1.7b"
 
 
+# ── Métricas de trajetória ───────────────────────────────────────────────────
+
 @dataclass
-class ComparisonResult:
-    case: EvalCase
-    response_none: str
-    response_mem: str
-    response_full: str
-    score_none: float
-    score_mem: float
-    score_full: float
-    traj_norms: List[float] = field(default_factory=list)
-    traj_cosines: List[float] = field(default_factory=list)
+class TrajStep:
+    norm: float
+    cos_prev: Optional[float]   # None no primeiro passo (sem anterior)
+    step_size: Optional[float]  # None no primeiro passo
+    component_std: float
 
 
-def seed_memory(model, injector, updater, memory, conversation):
-    """
-    Processa as mensagens de user da conversa prévia para acumular mₜ.
-    Retorna lista de vetores capturados a cada passo (para análise de trajetória).
-    """
-    trajectory = []
+def compute_traj_step(current: torch.Tensor, previous: Optional[torch.Tensor]) -> TrajStep:
+    norm = current.norm().item()
+    std  = current.std().item()
+    if previous is None:
+        return TrajStep(norm=norm, cos_prev=None, step_size=None, component_std=std)
+    cos = F.cosine_similarity(previous.unsqueeze(0), current.unsqueeze(0)).item()
+    step = (current - previous).norm().item()
+    return TrajStep(norm=norm, cos_prev=cos, step_size=step, component_std=std)
+
+
+def fmt_traj(steps: List[TrajStep]) -> str:
+    parts = []
+    for i, s in enumerate(steps):
+        cos_str  = f"cos={s.cos_prev:.3f}" if s.cos_prev is not None else "cos=—"
+        step_str = f"Δ={s.step_size:.4f}" if s.step_size is not None else "Δ=—"
+        parts.append(f"  t{i}: |m|={s.norm:.4f}  {cos_str}  {step_str}  std={s.component_std:.4f}")
+    return "\n".join(parts)
+
+
+# ── Seeding de memória ───────────────────────────────────────────────────────
+
+def seed_memory(model, injector, updater, memory, conversation) -> List[TrajStep]:
+    traj: List[TrajStep] = []
     last_layer = model.num_layers - 1
+    prev_vec: Optional[torch.Tensor] = None
 
     for msg in conversation:
         if msg["role"] != "user":
@@ -75,135 +95,124 @@ def seed_memory(model, injector, updater, memory, conversation):
         m_next = updater(memory.vector.to(e_t.device), e_t)
         memory.update(m_next.cpu())
         injector.set_memory(memory.vector.to(model.model.device))
-        trajectory.append(memory.vector.clone())
 
-    return trajectory
+        step = compute_traj_step(memory.vector, prev_vec)
+        traj.append(step)
+        prev_vec = memory.vector.clone()
+
+    return traj
 
 
-def trajectory_stats(vecs):
-    """Retorna (cosenos, normas) dos vetores de trajetória."""
-    norms = [v.norm().item() for v in vecs]
-    if len(vecs) < 2:
-        return [], norms
-    cosines = [
-        F.cosine_similarity(vecs[i - 1].unsqueeze(0), vecs[i].unsqueeze(0)).item()
-        for i in range(1, len(vecs))
-    ]
-    return cosines, norms
-
+# ── Runner principal ─────────────────────────────────────────────────────────
 
 def run():
-    print("=" * 60)
-    print("EXPERIMENTO v1: Benchmark comparativo de memória")
-    print("=" * 60)
+    print("=" * 65)
+    print("EXPERIMENTO v1.1 — scale sweep, injeção identidade")
+    print("=" * 65)
 
-    # 1. Carregar modelo HF
     print(f"\n[1] Carregando {MODEL_NAME}...")
     model = InstrumentedModel(MODEL_NAME, device="auto")
     model.load()
     hidden_dim = model.hidden_dim
     print(f"    {model.num_layers} camadas, hidden_dim={hidden_dim}")
 
-    # 2. Componentes reutilizáveis
-    updater = EMAUpdater(alpha=EMA_ALPHA)
-    injector = ActivationInjector(
-        memory_dim=hidden_dim, hidden_dim=hidden_dim, scale=INJECT_SCALE
-    )
+    updater  = EMAUpdater(alpha=EMA_ALPHA)
+    injector = ActivationInjector(memory_dim=hidden_dim, hidden_dim=hidden_dim)
     baseline = FullContextBaseline(model=OLLAMA_MODEL)
 
-    results: List[ComparisonResult] = []
+    # scores[scale_str][category] → lista de floats
+    scores: dict = {}
+    traj_log: dict = {}  # case_label → List[TrajStep] (última rodada, scale independente)
 
-    for i, case in enumerate(SAMPLE_BENCHMARK):
-        print(f"\n{'─' * 60}")
-        print(f"Caso {i + 1}/{len(SAMPLE_BENCHMARK)} [{case.category}]")
-        print(f"Query: {case.query}")
-
-        # ── Condição 1: sem memória ──────────────────────────────
+    # ── Condição sem_memoria (scale 0.0 sem hooks) ───────────────────────────
+    print("\n" + "─" * 65)
+    print("Condição: sem_memoria")
+    scores["sem_memoria"] = {}
+    for case in SAMPLE_BENCHMARK:
         model.remove_all_hooks()
-        response_none = model.generate(case.query, max_new_tokens=MAX_NEW_TOKENS)
-        score_none = score_fact_retention(response_none, case.expected_elements)
-        print(f"\n  [sem_memoria]  score={score_none:.2f}")
-        print(f"  {response_none[:120]!r}")
+        resp = model.generate(case.query, max_new_tokens=MAX_NEW_TOKENS)
+        sc   = score_fact_retention(resp, case.expected_elements)
+        scores["sem_memoria"].setdefault(case.category, []).append(sc)
+        print(f"  [{case.category}] score={sc:.2f}  {resp[:80]!r}")
 
-        # ── Condição 2: EMA + injeção em ativações ───────────────
-        model.remove_all_hooks()
-        memory = MemoryState(dim=hidden_dim)
-        injector.set_memory(memory.vector)
+    # ── Condição ema_memoria por scale ───────────────────────────────────────
+    for scale in SCALES:
+        key = f"ema_s={scale}"
+        scores[key] = {}
+        print(f"\n{'─' * 65}")
+        print(f"Condição: ema_memoria  scale={scale}")
 
-        model.register_read_hook(model.num_layers - 1)
-        model.register_write_hook(TARGET_LAYER, injector.modifier_fn)
+        for case in SAMPLE_BENCHMARK:
+            model.remove_all_hooks()
+            memory = MemoryState(dim=hidden_dim)
+            injector.set_scale(scale)
+            injector.set_memory(memory.vector)
 
-        trajectory = seed_memory(model, injector, updater, memory, case.conversation)
-        response_mem = model.generate(case.query, max_new_tokens=MAX_NEW_TOKENS)
-        score_mem = score_fact_retention(response_mem, case.expected_elements)
+            model.register_read_hook(model.num_layers - 1)
+            model.register_write_hook(TARGET_LAYER, injector.modifier_fn)
 
-        cosines, norms = trajectory_stats(trajectory)
-        norm_str = f"|mₜ|={norms[-1]:.4f}" if norms else "mₜ=zero"
-        print(f"\n  [ema_memoria]  score={score_mem:.2f}  {norm_str}")
-        if cosines:
-            print(f"  cos(mₜ,mₜ₊₁)={[f'{c:.3f}' for c in cosines]}")
-        print(f"  {response_mem[:120]!r}")
+            traj = seed_memory(model, injector, updater, memory, case.conversation)
 
-        # ── Condição 3: full context via Ollama ──────────────────
+            resp = model.generate(case.query, max_new_tokens=MAX_NEW_TOKENS)
+            sc   = score_fact_retention(resp, case.expected_elements)
+            scores[key].setdefault(case.category, []).append(sc)
+
+            label = f"{case.category}_{len(scores[key][case.category])}"
+            traj_log[label] = traj  # sobrescreve a cada scale; usado na última iteração
+
+            print(f"  [{case.category}] score={sc:.2f}  {resp[:80]!r}")
+            if traj:
+                last = traj[-1]
+                cos_str = f"{last.cos_prev:.3f}" if last.cos_prev is not None else "—"
+                print(f"    |mₜ|={last.norm:.4f}  cos={cos_str}  std={last.component_std:.4f}")
+
+    # ── Condição full_context ────────────────────────────────────────────────
+    print(f"\n{'─' * 65}")
+    print("Condição: full_context (Ollama)")
+    scores["full_context"] = {}
+    for case in SAMPLE_BENCHMARK:
         baseline.reset()
         baseline.history = list(case.conversation)
         try:
-            response_full = baseline.chat(case.query)
-            score_full = score_fact_retention(response_full, case.expected_elements)
+            resp = baseline.chat(case.query)
+            sc   = score_fact_retention(resp, case.expected_elements)
         except Exception as e:
-            response_full = f"[ERRO Ollama: {e}]"
-            score_full = 0.0
-        print(f"\n  [full_context] score={score_full:.2f}")
-        print(f"  {response_full[:120]!r}")
+            resp = f"[ERRO: {e}]"
+            sc   = 0.0
+        scores["full_context"].setdefault(case.category, []).append(sc)
+        print(f"  [{case.category}] score={sc:.2f}  {resp[:80]!r}")
 
-        results.append(
-            ComparisonResult(
-                case=case,
-                response_none=response_none,
-                response_mem=response_mem,
-                response_full=response_full,
-                score_none=score_none,
-                score_mem=score_mem,
-                score_full=score_full,
-                traj_norms=norms,
-                traj_cosines=cosines,
-            )
-        )
+    # ── Tabela de scores ─────────────────────────────────────────────────────
+    categories = sorted({c for v in scores.values() for c in v})
+    col_w = 10
 
-    # ── Sumário por categoria ────────────────────────────────────
-    print(f"\n{'=' * 60}")
-    print("SUMÁRIO POR CATEGORIA")
-    print(f"{'=' * 60}")
-    print(f"{'categoria':<22} {'sem_mem':>8} {'ema_mem':>8} {'full_ctx':>9}")
-    print(f"{'─' * 22} {'─' * 8} {'─' * 8} {'─' * 9}")
+    print(f"\n{'=' * 65}")
+    print("SCORES POR SCALE E CATEGORIA")
+    print(f"{'=' * 65}")
+    header = f"{'condição':<22}" + "".join(f"{c:>{col_w}}" for c in categories) + f"{'TOTAL':>{col_w}}"
+    print(header)
+    print("─" * len(header))
 
-    categories = sorted({r.case.category for r in results})
-    for cat in categories:
-        cat_results = [r for r in results if r.case.category == cat]
-        n = len(cat_results)
-        avg_none = sum(r.score_none for r in cat_results) / n
-        avg_mem = sum(r.score_mem for r in cat_results) / n
-        avg_full = sum(r.score_full for r in cat_results) / n
-        print(f"{cat:<22} {avg_none:>8.2f} {avg_mem:>8.2f} {avg_full:>9.2f}")
+    for cond, cat_scores in scores.items():
+        all_vals = [v for vals in cat_scores.values() for v in vals]
+        total = sum(all_vals) / len(all_vals) if all_vals else 0.0
+        row = f"{cond:<22}"
+        for cat in categories:
+            vals = cat_scores.get(cat, [])
+            avg = sum(vals) / len(vals) if vals else 0.0
+            row += f"{avg:>{col_w}.2f}"
+        row += f"{total:>{col_w}.2f}"
+        print(row)
 
-    print(f"{'─' * 22} {'─' * 8} {'─' * 8} {'─' * 9}")
-    avg_none = sum(r.score_none for r in results) / len(results)
-    avg_mem = sum(r.score_mem for r in results) / len(results)
-    avg_full = sum(r.score_full for r in results) / len(results)
-    print(f"{'TOTAL':<22} {avg_none:>8.2f} {avg_mem:>8.2f} {avg_full:>9.2f}")
+    # ── Trajetória de mₜ ─────────────────────────────────────────────────────
+    print(f"\n{'=' * 65}")
+    print(f"TRAJETÓRIA DE mₜ (scale={SCALES[-1]}, último seeding por caso)")
+    print(f"{'=' * 65}")
+    for label, traj in traj_log.items():
+        print(f"\n  {label}:")
+        print(fmt_traj(traj))
 
-    # ── Estabilidade de trajetória ───────────────────────────────
-    print(f"\n{'=' * 60}")
-    print("ESTABILIDADE DE TRAJETÓRIA (EMA)")
-    print(f"{'=' * 60}")
-    for r in results:
-        label = f"[{r.case.category}]"
-        if r.traj_norms:
-            print(f"  {label:<18} normas  = {[f'{n:.3f}' for n in r.traj_norms]}")
-        if r.traj_cosines:
-            print(f"  {'':<18} cosenos = {[f'{c:.3f}' for c in r.traj_cosines]}")
-
-    print("\nv1 concluído.")
+    print("\nv1.1 concluído. Preencher experiments/results/log.md com os valores acima.")
 
 
 if __name__ == "__main__":
